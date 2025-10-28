@@ -13,14 +13,16 @@ const logger = winston.createLogger({
   defaultMeta: { service: 'user-service' },
   transports: [
     //
-    // - Write all logs with importance level of `error` or less to `error.log`
-    // - Write all logs with importance level of `info` or less to `combined.log`
+    // - Write all logs with importance level of `error` or less to `/tmp/logs/error.log`
+    // - Write all logs with importance level of `info` or less to `/tmp/logs/combined.log`
     //
-    new winston.transports.File({ filename: 'logs/error.log', level: 'error' }),
-    new winston.transports.File({ filename: 'logs/combined.log' }),
+    // **CRITICAL FIX: Changed paths to use the Vercel/Lambda writable directory /tmp/**
+    new winston.transports.File({ filename: '/tmp/logs/error.log', level: 'error' }),
+    new winston.transports.File({ filename: '/tmp/logs/combined.log' }),
   ],
   exceptionHandlers: [
-    new winston.transports.File({ filename: 'logs/exceptions.log' })
+    // **CRITICAL FIX: Changed paths to use the Vercel/Lambda writable directory /tmp/**
+    new winston.transports.File({ filename: '/tmp/logs/exceptions.log' })
   ]
 });
 
