@@ -6,10 +6,64 @@ import logger from '../utils/logger.js';
 
 const router = express.Router();
 
+// Helper function to clean insurance data
+const cleanInsuranceData = (data) => {
+  if (data.insurance) {
+    if (!data.insurance.provider || data.insurance.provider === '') {
+      data.insurance.provider = null;
+    }
+    if (!data.insurance.membershipNumber || data.insurance.membershipNumber === '') {
+      data.insurance.membershipNumber = null;
+    }
+  }
+  return data;
+};
+
+// @desc    Search patients (Updated to support 'q' query parameter)
+// @route   GET /api/patients/search
+// @access  Private (Admin, Doctor, Nurse, Receptionist, Pharmacist)
+router.get('/search', protect, authorize('admin', 'doctor', 'receptionist', 'pharmacist', 'nurse'), async (req, res) => {
+  try {
+    const { q, name } = req.query;
+    const searchQuery = q || name;
+    
+    if (!searchQuery) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'Search query is required'
+      });
+    }
+
+    const patients = await Patient.find({
+      $or: [
+        { firstName: { $regex: searchQuery, $options: 'i' } },
+        { middleName: { $regex: searchQuery, $options: 'i' } },
+        { lastName: { $regex: searchQuery, $options: 'i' } },
+        { email: { $regex: searchQuery, $options: 'i' } },
+        { phone: { $regex: searchQuery, $options: 'i' } },
+        { patientId: { $regex: searchQuery, $options: 'i' } }
+      ]
+    }).limit(10);
+
+    res.status(200).json({
+      status: 'success',
+      count: patients.length,
+      patients: patients,
+      data: patients
+    });
+  } catch (error) {
+    logger.error('Search patients error:', error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Server error'
+    });
+  }
+});
+
 // @desc    Get all patients
 // @route   GET /api/patients
 // @access  Private (Admin, Doctor, Nurse)
-router.get('/', protect, authorize('admin', 'doctor', 'receptionist'), async (req, res) => {
+router.get('/', protect, authorize('admin', 'doctor', 'receptionist', 'pharmacist'), async (req, res) => {
   try {
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 10;
@@ -22,7 +76,6 @@ router.get('/', protect, authorize('admin', 'doctor', 'receptionist'), async (re
       .limit(limit)
       .sort({ createdAt: -1 });
 
-    // Pagination result
     const pagination = {};
 
     if (endIndex < total) {
@@ -54,48 +107,10 @@ router.get('/', protect, authorize('admin', 'doctor', 'receptionist'), async (re
   }
 });
 
-// @desc    Search patients
-// @route   GET /api/patients/search
-// @access  Private (Admin, Doctor, Nurse)
-router.get('/search', protect, authorize('admin', 'doctor', 'receptionist'), async (req, res) => {
-  try {
-    const { q } = req.query;
-    
-    if (!q) {
-      return res.status(400).json({
-        status: 'error',
-        message: 'Search query is required'
-      });
-    }
-
-    const patients = await Patient.find({
-      $or: [
-        { firstName: { $regex: q, $options: 'i' } },
-        { lastName: { $regex: q, $options: 'i' } },
-        { email: { $regex: q, $options: 'i' } },
-        { phone: { $regex: q, $options: 'i' } }
-      ]
-    }).limit(10);
-
-    res.status(200).json({
-      status: 'success',
-      count: patients.length,
-      patients: patients,
-      data: patients
-    });
-  } catch (error) {
-    logger.error('Search patients error:', error);
-    res.status(500).json({
-      status: 'error',
-      message: 'Server error'
-    });
-  }
-});
-
 // @desc    Get single patient
 // @route   GET /api/patients/:id
 // @access  Private (Admin, Doctor, Nurse)
-router.get('/:id', protect, authorize('admin', 'doctor', 'nurse'), async (req, res) => {
+router.get('/:id', protect, authorize('admin', 'doctor', 'receptionist'), async (req, res) => {
   try {
     const patient = await Patient.findById(req.params.id);
 
@@ -122,14 +137,21 @@ router.get('/:id', protect, authorize('admin', 'doctor', 'nurse'), async (req, r
 // @desc    Create new patient
 // @route   POST /api/patients
 // @access  Private (Admin, Doctor, Nurse, Receptionist)
-router.post('/', protect, authorize('admin', 'doctor', 'nurse', 'receptionist'), [
+router.post('/', protect, authorize('admin', 'receptionist'), [
   body('firstName').trim().isLength({ min: 2, max: 50 }).withMessage('First name must be between 2 and 50 characters'),
+  body('middleName').trim().isLength({ min:2, max: 50 }).withMessage('Middle name must be between 2 and 50 characters'),
   body('lastName').trim().isLength({ min: 2, max: 50 }).withMessage('Last name must be between 2 and 50 characters'),
   body('email').optional().isEmail().normalizeEmail().withMessage('Please provide a valid email'),
   body('phone').matches(/^[\+]?[1-9][\d]{0,15}$/).withMessage('Please provide a valid phone number'),
   body('dateOfBirth').isISO8601().withMessage('Please provide a valid date of birth'),
-  body('gender').isIn(['male', 'female', 'other']).withMessage('Invalid gender'),
+  body('gender').isIn(['Male', 'Female', 'Other']).withMessage('Invalid gender'),
   body('bloodType').optional().isIn(['A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-']).withMessage('Invalid blood type'),
+  body('maritalStatus').optional().isIn(['Single', 'Married', 'Divorced', 'Widowed', 'Other']).withMessage('Invalid marital status'),
+  body('address.country').optional().isIn(['Tanzania, United Republic of']).withMessage('Please provide a valid country'),
+  body('address.region').optional().trim().isLength({ min: 2, max: 100 }),
+  body('address.district').optional().trim().isLength({ min: 2, max: 100 }),
+  body('address.ward').optional().trim().isLength({ min: 2, max: 100 }),
+  body('address.street').optional().trim().isLength({ min: 2, max: 100 }),
   body('emergencyContact.name').optional().trim().isLength({ min: 2, max: 100 }).withMessage('Emergency contact name must be between 2 and 100 characters'),
   body('emergencyContact.phone').optional().matches(/^[\+]?[1-9][\d]{0,15}$/).withMessage('Please provide a valid emergency contact phone number'),
   body('emergencyContact.relationship').optional().trim().isLength({ min: 2, max: 50 }).withMessage('Emergency contact relationship must be between 2 and 50 characters'),
@@ -144,11 +166,14 @@ router.post('/', protect, authorize('admin', 'doctor', 'nurse', 'receptionist'),
       });
     }
 
+    // Clean insurance data
+    let patientData = cleanInsuranceData(req.body);
+
     // Check if patient already exists with same email or phone
     const existingPatient = await Patient.findOne({
       $or: [
-        { email: req.body.email },
-        { phone: req.body.phone }
+        { email: patientData.email },
+        { phone: patientData.phone }
       ]
     });
 
@@ -159,7 +184,7 @@ router.post('/', protect, authorize('admin', 'doctor', 'nurse', 'receptionist'),
       });
     }
 
-    const patient = await Patient.create(req.body);
+    const patient = await Patient.create(patientData);
 
     res.status(201).json({
       status: 'success',
@@ -177,15 +202,22 @@ router.post('/', protect, authorize('admin', 'doctor', 'nurse', 'receptionist'),
 
 // @desc    Update patient
 // @route   PUT /api/patients/:id
-// @access  Private (Admin, Doctor, Nurse)
-router.put('/:id', protect, authorize('admin', 'doctor', 'nurse'), [
+// @access  Private (Admin, Receptionist)
+router.put('/:id', protect, authorize('admin', 'receptionist'), [
   body('firstName').optional().trim().isLength({ min: 2, max: 50 }).withMessage('First name must be between 2 and 50 characters'),
+  body('middleName').optional().trim().isLength({ min: 2, max: 50 }).withMessage('Middle name must be between 2 and 50 characters'),
   body('lastName').optional().trim().isLength({ min: 2, max: 50 }).withMessage('Last name must be between 2 and 50 characters'),
   body('email').optional().isEmail().normalizeEmail().withMessage('Please provide a valid email'),
   body('phone').optional().matches(/^[\+]?[1-9][\d]{0,15}$/).withMessage('Please provide a valid phone number'),
   body('dateOfBirth').optional().isISO8601().withMessage('Please provide a valid date of birth'),
-  body('gender').optional().isIn(['male', 'female', 'other']).withMessage('Invalid gender'),
+  body('gender').optional().isIn(['Male', 'Female', 'Other']).withMessage('Invalid gender'),
   body('bloodType').optional().isIn(['A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-']).withMessage('Invalid blood type'),
+  body('maritalStatus').optional().isIn(['Single', 'Married', 'Divorced', 'Widowed', 'Other']).withMessage('Invalid marital status'),
+  body('address.country').optional().isIn(['Tanzania, United Republic of']).withMessage('Please provide a valid country'),
+  body('address.region').optional().trim().isLength({ min: 2, max: 100 }),
+  body('address.district').optional().trim().isLength({ min: 2, max: 100 }),
+  body('address.ward').optional().trim().isLength({ min: 2, max: 100 }),
+  body('address.street').optional().trim().isLength({ min: 2, max: 100 }),
   body('emergencyContact.name').optional().trim().isLength({ min: 2, max: 100 }).withMessage('Emergency contact name must be between 2 and 100 characters'),
   body('emergencyContact.phone').optional().matches(/^[\+]?[1-9][\d]{0,15}$/).withMessage('Please provide a valid emergency contact phone number'),
   body('emergencyContact.relationship').optional().trim().isLength({ min: 2, max: 50 }).withMessage('Emergency contact relationship must be between 2 and 50 characters'),
@@ -228,7 +260,10 @@ router.put('/:id', protect, authorize('admin', 'doctor', 'nurse'), [
       }
     }
 
-    patient = await Patient.findByIdAndUpdate(req.params.id, req.body, {
+    // Clean insurance data before updating
+    const updateData = cleanInsuranceData(req.body);
+
+    patient = await Patient.findByIdAndUpdate(req.params.id, updateData, {
       new: true,
       runValidators: true
     });
@@ -260,7 +295,7 @@ router.delete('/:id', protect, authorize('admin'), async (req, res) => {
       });
     }
 
-    await patient.remove();
+    await patient.deleteOne();
 
     res.status(200).json({
       status: 'success',

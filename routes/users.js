@@ -2,6 +2,7 @@ import express from 'express';
 import { body, validationResult } from 'express-validator';
 import User from '../models/User.js';
 import { protect, authorize } from '../middleware/auth.js';
+import sendEmail from '../utils/sendEmail.js';
 import logger from '../utils/logger.js';
 
 const router = express.Router();
@@ -90,15 +91,45 @@ router.post(
       user = new User(req.body);
       await user.save();
 
-      // Don't send the password back
-      const userResponse = { ...user._doc };
-      delete userResponse.password;
+      // Generate verification token and send verification email
+      const verificationToken = user.getVerificationToken();
+      await user.save({ validateBeforeSave: false });
 
-      res.status(201).json({
-        status: 'success',
-        message: 'User created successfully',
-        data: userResponse
-      });
+      const verifyURL = `${process.env.FRONTEND_URL}/verify-email/${verificationToken}`;
+      const message = `Please verify your email by clicking the following link: \n\n ${verifyURL}`;
+
+      try {
+        await sendEmail({
+          email: user.email,
+          subject: 'Email Verification',
+          message,
+        });
+
+        // Don't send the password back
+        const userResponse = { ...user._doc };
+        delete userResponse.password;
+
+        res.status(201).json({
+          status: 'success',
+          message: 'User created successfully. Verification email sent.',
+          data: userResponse
+        });
+      } catch (emailError) {
+        logger.error('Verification email error:', emailError);
+        // If email fails, clear the token but still return success for user creation
+        user.verificationToken = undefined;
+        await user.save({ validateBeforeSave: false });
+
+        // Don't send the password back
+        const userResponse = { ...user._doc };
+        delete userResponse.password;
+
+        res.status(201).json({
+          status: 'success',
+          message: 'User created successfully, but verification email could not be sent',
+          data: userResponse
+        });
+      }
     } catch (error) {
       logger.error('Create user error:', error);
       res.status(500).json({
@@ -141,142 +172,55 @@ router.get('/profile', protect, async (req, res) => {
 // @route   PUT /api/users/preferences
 // @access  Private
 router.put('/preferences', protect, async (req, res) => {
-    try {
-        // Find the user and update only the preferences field
-        const user = await User.findByIdAndUpdate(
-            req.user.id,
-            { preferences: req.body },
-            { new: true, runValidators: true }
-        );
-
-        res.status(200).json({
-            status: 'success',
-            data: { preferences: user.preferences }
-        });
-    } catch (error) {
-        logger.error('Update preferences error:', error);
-        res.status(500).json({ status: 'error', message: 'Server Error' });
-    }
-});
-
-// @desc    Update current user profile
-// @route   PUT /api/users/profile
-// @access  Private
-router.put('/profile', protect, [
-  body('firstName').optional().trim().isLength({ min: 2, max: 50 }).withMessage('First name must be between 2 and 50 characters'),
-  body('lastName').optional().trim().isLength({ min: 2, max: 50 }).withMessage('Last name must be between 2 and 50 characters'),
-  body('email').optional().isEmail().normalizeEmail().withMessage('Please provide a valid email'),
-  body('phone').optional().matches(/^[\+]?[1-9][\d]{0,15}$/).withMessage('Please provide a valid phone number'),
-  body('gender').optional().isIn(['male', 'female', 'other', 'prefer_not_to_say']).withMessage('Invalid gender'),
-], async (req, res) => {
   try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({
-        status: 'error',
-        message: 'Validation failed',
-        errors: errors.array()
-      });
-    }
-
-    // Extract allowed fields for profile update
-    const {
-      firstName,
-      lastName,
-      email,
-      phone,
-      address,
-      dateOfBirth,
-      gender,
-      department,
-      specialization,
-      licenseNumber
-    } = req.body;
-
-    // Build update object with only provided fields
-    const updateFields = {};
-    
-    if (firstName !== undefined) updateFields.firstName = firstName;
-    if (lastName !== undefined) updateFields.lastName = lastName;
-    if (email !== undefined) updateFields.email = email;
-    if (phone !== undefined) updateFields.phone = phone;
-    if (address !== undefined) updateFields.address = address;
-    if (dateOfBirth !== undefined) updateFields.dateOfBirth = dateOfBirth;
-    if (gender !== undefined) updateFields.gender = gender;
-    if (department !== undefined) updateFields.department = department;
-    if (specialization !== undefined) updateFields.specialization = specialization;
-    if (licenseNumber !== undefined) updateFields.licenseNumber = licenseNumber;
-
-    // Check if email is being changed and if it's already taken
-    if (email && email !== req.user.email) {
-      const existingUser = await User.findOne({ email });
-      if (existingUser) {
-        return res.status(400).json({
-          status: 'error',
-          message: 'Email is already taken',
-          errors: [{
-            field: 'email',
-            message: 'Email is already taken'
-          }]
-        });
-      }
-    }
-
-    // req.user.id comes from the protect middleware after token verification
+    // Find the user and update only the preferences field
     const user = await User.findByIdAndUpdate(
       req.user.id,
-      updateFields,
-      {
-        new: true,
-        runValidators: true
-      }
-    ).select('-password');
-
-    if (!user) {
-      return res.status(404).json({
-        status: 'error',
-        message: 'User not found'
-      });
-    }
+      { preferences: req.body },
+      { new: true, runValidators: true }
+    );
 
     res.status(200).json({
       status: 'success',
-      data: user,
-      message: 'Profile updated successfully'
+      data: { preferences: user.preferences }
     });
   } catch (error) {
-    logger.error('Update user error:', error);
+    logger.error('Update preferences error:', error);
+    res.status(500).json({ status: 'error', message: 'Server Error' });
+  }
+});
+
+// @desc    Update user details (by Admin)
+// @route   PUT /api/users/:id
+// @access  Private (Admin only)
+router.put('/:id', async (req, res) => {
+  try {
+    const { firstName, lastName, email, role, isActive } = req.body;
     
-    // Handle validation errors
-    if (error.name === 'ValidationError') {
-      const errors = Object.values(error.errors).map(val => ({
-        field: val.path,
-        message: val.message
-      }));
-      
-      return res.status(400).json({
-        status: 'error',
-        message: 'Validation error',
-        errors
-      });
-    }
-    
-    // Handle duplicate email error
-    if (error.code === 11000) {
-      return res.status(400).json({
-        status: 'error',
-        message: 'Email already exists',
-        errors: [{
-          field: 'email',
-          message: 'Email already exists'
-        }]
-      });
+    const fieldsToUpdate = {
+      firstName,
+      lastName,
+      email,
+      role,
+      isActive
+    };
+
+    // Remove any undefined fields so they don't overwrite existing data
+    Object.keys(fieldsToUpdate).forEach(key => fieldsToUpdate[key] === undefined && delete fieldsToUpdate[key]);
+
+    const user = await User.findByIdAndUpdate(req.params.id, fieldsToUpdate, {
+      new: true,
+      runValidators: true
+    }).select('-password');
+
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
     }
 
-    res.status(500).json({
-      status: 'error',
-      message: 'Server error'
-    });
+    res.status(200).json({ success: true, data: user });
+} catch (error) {
+    logger.error('Admin update user error:', error);
+    res.status(400).json({ success: false, message: error.message });
   }
 });
 

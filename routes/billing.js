@@ -4,6 +4,7 @@ import { protect, authorize } from '../middleware/auth.js';
 import billingService from '../services/billingService.js';
 import Invoice from '../models/Invoice.js';
 import Payment from '../models/Payment.js';
+import Patient from '../models/Patient.js';
 import InsuranceProvider from '../models/InsuranceProvider.js';
 import logger from '../utils/logger.js';
 
@@ -27,14 +28,14 @@ const handleValidation = (req, res, next) => {
 // @access  Private (Admin, Receptionist, Doctor)
 router.get('/invoices',
   protect,
-  authorize('admin', 'receptionist', 'doctor'),
+  authorize('admin', 'receptionist', 'doctor', 'pharmacist'),
   async (req, res) => {
     try {
       const { 
         page = 1, 
         limit = 10, 
         status, 
-        search, // This is the search term from your page
+        search,
         sortBy = 'createdAt',
         order = 'desc'
       } = req.query;
@@ -42,27 +43,23 @@ router.get('/invoices',
       const skip = (page - 1) * limit;
       const sortOptions = { [sortBy]: order === 'desc' ? -1 : 1 };
       
-      // Aggregation pipeline allows for advanced queries, like searching on populated fields
       const pipeline = [];
 
-      // Stage 1: Initial filtering (match)
       const matchStage = {};
       if (status && status !== 'all') {
         matchStage.status = status;
       }
 
-      // Stage 2: Look up patient data to search by name
       pipeline.push({
         $lookup: {
-          from: 'patients', // The name of the Patient collection in MongoDB
+          from: 'patients',
           localField: 'patient',
           foreignField: '_id',
           as: 'patientInfo'
         }
       });
-      pipeline.push({ $unwind: '$patientInfo' }); // Deconstruct the patientInfo array
+      pipeline.push({ $unwind: '$patientInfo' });
 
-      // Stage 3: Add search logic
       if (search) {
         matchStage.$or = [
           { 'patientInfo.firstName': { $regex: search, $options: 'i' } },
@@ -71,22 +68,19 @@ router.get('/invoices',
         ];
       }
 
-      // Add the match stage to the pipeline if it has any conditions
       if (Object.keys(matchStage).length > 0) {
         pipeline.push({ $match: matchStage });
       }
       
-      // Stage 4: Pagination and Sorting
       const countPipeline = [...pipeline, { $count: 'total' }];
       const dataPipeline = [
         ...pipeline,
         { $sort: sortOptions },
         { $skip: skip },
         { $limit: parseInt(limit) },
-        // We need to re-populate the 'generatedBy' field after the search
         { $lookup: { from: 'users', localField: 'generatedBy', foreignField: '_id', as: 'generatedByInfo' }},
         { $unwind: '$generatedByInfo' },
-        { $project: { // Clean up the final output
+        { $project: {
             invoiceNumber: 1, createdAt: 1, totalAmount: 1, status: 1,
             patient: '$patientInfo',
             generatedBy: { firstName: '$generatedByInfo.firstName', lastName: '$generatedByInfo.lastName' }
@@ -174,11 +168,36 @@ router.post('/invoices',
   handleValidation,
   async (req, res) => {
     try {
-      const invoice = await billingService.createInvoice(req.body, req.user.id);
+      // Fetch the patient to check if they have insurance
+      const patient = await Patient.findById(req.body.patient);
+      
+      if (!patient) {
+        return res.status(404).json({
+          status: 'error',
+          message: 'Patient not found'
+        });
+      }
+
+      // Check if patient has insurance (has a provider)
+      const hasInsurance = !!(patient.insurance?.provider);
+
+      // Create the invoice
+      let invoice = await billingService.createInvoice(req.body, req.user.id);
+
+      // If patient has insurance, mark invoice as paid immediately
+      if (hasInsurance) {
+        invoice.status = 'paid';
+        invoice.amountPaid = invoice.totalAmount;
+        invoice.balanceDue = 0;
+        invoice.paidDate = new Date();
+        await invoice.save();
+
+        logger.info(`Invoice ${invoice.invoiceNumber} auto-marked as paid for insured patient ${patient._id}`);
+      }
 
       res.status(201).json({
         status: 'success',
-        message: 'Invoice created successfully',
+        message: 'Invoice created successfully' + (hasInsurance ? ' and marked as paid (insurance coverage)' : ''),
         data: invoice
       });
     } catch (error) {
@@ -251,10 +270,8 @@ router.post('/invoices/:id/payments',
   handleValidation,
   async (req, res) => {
     try {
-      // Get the invoice ID from the URL parameter
       const invoiceId = req.params.id;
       
-      // Verify invoice exists
       const invoice = await Invoice.findById(invoiceId);
       if (!invoice) {
         return res.status(404).json({
@@ -263,14 +280,12 @@ router.post('/invoices/:id/payments',
         });
       }
 
-      // Prepare payment data
       const paymentData = {
         ...req.body,
         invoice: invoiceId,
-        patient: req.body.patient || invoice.patient // Use patient from body or invoice
+        patient: req.body.patient || invoice.patient
       };
 
-      // Process the payment using your existing service
       const payment = await billingService.processPayment(paymentData, req.user.id);
 
       res.status(201).json({
@@ -494,7 +509,7 @@ router.get('/statements/:patientId',
 
       const statement = await billingService.generateStatement(
         patientId,
-        startDate || new Date(Date.now() - 30 * 24 * 60 * 60 * 1000), // Default: last 30 days
+        startDate || new Date(Date.now() - 30 * 24 * 60 * 60 * 1000),
         endDate || new Date()
       );
 
@@ -525,7 +540,6 @@ router.get('/statistics',
       if (startDate) dateQuery.$gte = new Date(startDate);
       if (endDate) dateQuery.$lte = new Date(endDate);
 
-      // Get invoice statistics
       const invoiceStats = await Invoice.aggregate([
         { $match: dateQuery.createdAt ? { createdAt: dateQuery } : {} },
         {
@@ -540,7 +554,6 @@ router.get('/statistics',
         }
       ]);
 
-      // Get payment statistics
       const paymentStats = await Payment.aggregate([
         { $match: dateQuery.paymentDate ? { paymentDate: dateQuery } : {} },
         {
@@ -552,7 +565,6 @@ router.get('/statistics',
         }
       ]);
 
-      // Get overdue invoices
       const overdueInvoices = await Invoice.countDocuments({
         status: 'overdue'
       });
